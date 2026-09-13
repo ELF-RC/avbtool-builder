@@ -1,11 +1,7 @@
-name: Build A.R.T (Nuitka)
+name: Build avbtool (Nuitka)
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Release version"
-        required: false
 
 permissions:
   contents: read
@@ -16,12 +12,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
+          - os_version: ubuntu22.04
+            arch: amd64
             runner: ubuntu-22.04
-            arch_suffix: amd64
-          - arch: arm64
+          - os_version: ubuntu22.04
+            arch: arm64
             runner: ubuntu-22.04-arm
-            arch_suffix: arm64
 
     runs-on: ${{ matrix.runner }}
 
@@ -37,49 +33,80 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y patchelf ccache unzip
+          sudo apt-get install -y patchelf ccache
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install nuitka ordered-set zstandard
-          pip install requests rich protobuf
-
-      - name: Determine version
-        id: version
-        run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=dev" >> "$GITHUB_OUTPUT"
-          fi
+          python -m pip install nuitka ordered-set zstandard cryptography
 
       - name: Build with Nuitka
+        id: build
         run: |
-           python -m nuitka \
+          set -o pipefail
+          mkdir -p build_logs
+          ARTIFACT_NAME="avbtool-nuitka-${{ matrix.os_version }}-${{ matrix.arch }}"
+          WORKSPACE_NAME="workspace-nuitka-${{ matrix.os_version }}-${{ matrix.arch }}"
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "workspace_name=$WORKSPACE_NAME" >> "$GITHUB_OUTPUT"
+
+          python -m nuitka \
             --standalone \
             --onefile \
-            --output-filename=art \
-            --output-dir=.art-dist \
+            --output-filename=avbtool \
+            --output-dir=.avbtool-dist \
+            --include-package=cryptography \
             --assume-yes-for-downloads \
             --verbose \
-            --verbose-output=nuitka-build.log \
+            --verbose-output=build_logs/nuitka-build.log \
             --onefile-no-compression \
             --static-libpython=yes \
-            art.py 2>&1 | tee nuitka-stdout.log
+            avbtool.py > build_logs/nuitka-stdout.log 2>&1
+
+          SMOKE_DIR="$(mktemp -d)"
+          export SMOKE_DIR
+          python - <<'PY' >> build_logs/nuitka-smoke.log 2>&1
+          import os
+          from pathlib import Path
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.primitives.asymmetric import rsa
+
+          key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+          Path(os.environ['SMOKE_DIR'], 'key.pem').write_bytes(
+              key.private_bytes(
+                  serialization.Encoding.PEM,
+                  serialization.PrivateFormat.TraditionalOpenSSL,
+                  serialization.NoEncryption()))
+          PY
+          dd if=/dev/zero of="$SMOKE_DIR/system.img" bs=4096 count=2 status=none
+
+          env -i PATH=/nonexistent HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+            .avbtool-dist/avbtool version >> build_logs/nuitka-smoke.log 2>&1
+          env -i PATH=/nonexistent HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+            .avbtool-dist/avbtool make_vbmeta_image \
+              --output "$SMOKE_DIR/vbmeta.img" \
+              --algorithm SHA256_RSA2048 \
+              --key "$SMOKE_DIR/key.pem" \
+              --prop smoke:test >> build_logs/nuitka-smoke.log 2>&1
+          env -i PATH=/nonexistent HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+            .avbtool-dist/avbtool add_hashtree_footer \
+              --image "$SMOKE_DIR/system.img" \
+              --partition_size 1048576 \
+              --partition_name system \
+              --algorithm NONE \
+              --salt 0000000000000000000000000000000000000000000000000000000000000000 \
+              >> build_logs/nuitka-smoke.log 2>&1
 
       - name: Collect logs
         if: always()
         run: |
           mkdir -p logs
 
-          # Workflow environment info
           {
             echo "=== Workflow Environment ==="
             echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo "Runner: ${{ matrix.runner }}"
-            echo "Architecture: ${{ matrix.arch_suffix }}"
-            echo "Version: ${{ steps.version.outputs.version }}"
+            echo "Architecture: ${{ matrix.arch }}"
             echo ""
             echo "=== System Info ==="
             uname -a
@@ -97,28 +124,37 @@ jobs:
             free -h
           } > logs/workflow-env.log
 
-          # Copy Nuitka logs
-          [ -f nuitka-build.log ] && cp nuitka-build.log logs/ || echo "nuitka-build.log not found" > logs/nuitka-build.log
-          [ -f nuitka-stdout.log ] && cp nuitka-stdout.log logs/ || echo "nuitka-stdout.log not found" > logs/nuitka-stdout.log
+          for log in build_logs/*.log; do
+            if [ -f "$log" ]; then
+              cp "$log" logs/
+            fi
+          done
 
-          # Collect Nuitka internal logs if any
-          if ls .art-dist/*.log 2>/dev/null; then
-            cp .art-dist/*.log logs/
+          if ls .avbtool-dist/*.log 2>/dev/null; then
+            cp .avbtool-dist/*.log logs/
           fi
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ matrix.arch_suffix }}
+          name: logs-nuitka-${{ matrix.arch }}
           path: logs/
           retention-days: 30
 
-      - name: Upload binary
+      - name: Upload avbtool
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: art-${{ matrix.arch_suffix }}-v${{ steps.version.outputs.version }}
-          path: .art-dist/art
+          name: ${{ steps.build.outputs.artifact_name }}
+          path: .avbtool-dist/avbtool
           compression-level: 0
+          retention-days: 30
+
+      - name: Upload entire workspace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.workspace_name }}
+          path: ${{ github.workspace }}
           retention-days: 30
