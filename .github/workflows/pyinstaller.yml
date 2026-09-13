@@ -1,0 +1,49 @@
+name: Build avbtool
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os_version: ubuntu22.04
+            arch: amd64
+            runner: ubuntu-22.04
+          - os_version: ubuntu22.04
+            arch: arm64
+            runner: ubuntu-22.04-arm
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip openssl
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyinstaller
+
+      - name: Build avbtool
+        id: build
+        run: |
+          python3 -m PyInstaller \
+            --clean \
+            --onefile \
+            --name avbtool \
+            avbtool.py
+
+          BUILD_DATE=$(date +'%Y%m%d_%H%M%S')
+          ARTIFACT_NAME="avbtool-${{ matrix.os_version }}-${{ matrix.arch }}-${BUILD_DATE}"
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload avbtool
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.artifact_name }}
+          path: dist/avbtool
