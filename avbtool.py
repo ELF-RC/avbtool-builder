@@ -51,6 +51,11 @@ AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED = 1
 # Configuration for enabling logging of calls to avbtool.
 AVB_INVOCATION_LOGFILE = os.environ.get('AVB_INVOCATION_LOGFILE')
 
+# Passwords supplied with --pass-file are kept only for this invocation and
+# consumed by the in-process RSA loader. The key material itself is never
+# written to a decrypted temporary file.
+_KEY_PASSWORDS = {}
+
 
 class AvbError(Exception):
   """Application-specific errors.
@@ -335,6 +340,71 @@ def parse_number(string):
   return int(string, 0)
 
 
+def load_rsa_key(key_path, password=None, private_only=False):
+  """Loads an RSA key using the bundled cryptography implementation.
+
+  The old implementation delegated PEM/DER parsing to openssl. Keeping the
+  parser in-process means the frozen avbtool does not need an openssl binary.
+
+  Args:
+    key_path: Path to a PEM or DER RSA key.
+    password: Optional password for an encrypted private key.
+    private_only: Require a private key instead of accepting a public key.
+
+  Returns:
+    An ``RSAPrivateKey`` or ``RSAPublicKey`` instance.
+
+  Raises:
+    AvbError: If cryptography is unavailable or the key cannot be loaded.
+  """
+  try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+  except ImportError as e:
+    raise AvbError('The bundled cryptography package is unavailable: {}'
+                   .format(e))
+
+  try:
+    with open(key_path, 'rb') as key_file:
+      key_data = key_file.read()
+  except OSError as e:
+    raise AvbError('Unable to read RSA key {}: {}'.format(key_path, e))
+
+  password_bytes = None if password is None else password.encode('utf-8')
+  errors = []
+  key = None
+
+  private_loaders = (serialization.load_pem_private_key,
+                     serialization.load_der_private_key)
+  public_loaders = (serialization.load_pem_public_key,
+                    serialization.load_der_public_key)
+
+  for loader in private_loaders:
+    try:
+      key = loader(key_data, password=password_bytes)
+      break
+    except (TypeError, ValueError) as e:
+      errors.append(str(e))
+
+  if key is None and not private_only and password is None:
+    for loader in public_loaders:
+      try:
+        key = loader(key_data)
+        break
+      except (TypeError, ValueError) as e:
+        errors.append(str(e))
+
+  if key is None:
+    detail = errors[-1] if errors else 'unsupported key format'
+    raise AvbError('Unable to load RSA key {}: {}'.format(key_path, detail))
+
+  if not isinstance(key, (rsa.RSAPrivateKey, rsa.RSAPublicKey)):
+    raise AvbError('Key {} is not an RSA key'.format(key_path))
+  if private_only and not isinstance(key, rsa.RSAPrivateKey):
+    raise AvbError('Private RSA key required: {}'.format(key_path))
+  return key
+
+
 class RSAPublicKey(object):
   """Data structure used for a RSA public key.
 
@@ -355,45 +425,14 @@ class RSAPublicKey(object):
     Raises:
       AvbError: If RSA key parameters could not be read from file.
     """
-    # We used to have something as simple as this:
-    #
-    #  key = Crypto.PublicKey.RSA.importKey(open(key_path).read())
-    #  self.exponent = key.e
-    #  self.modulus = key.n
-    #  self.num_bits = key.size() + 1
-    #
-    # but unfortunately PyCrypto is not available in the builder. So
-    # instead just parse openssl(1) output to get this
-    # information. It's ugly but...
-    args = ['openssl', 'rsa', '-in', key_path, '-modulus', '-noout']
-    p = subprocess.Popen(args,
-                         stdin=subprocess.PIPE,
-                         stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE)
-    (pout, perr) = p.communicate()
-    if p.wait() != 0:
-      # Could be just a public key is passed, try that.
-      args.append('-pubin')
-      p = subprocess.Popen(args,
-                           stdin=subprocess.PIPE,
-                           stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE)
-      (pout, perr) = p.communicate()
-      if p.wait() != 0:
-        raise AvbError('Error getting public key: {}'.format(perr))
-
-    if not pout.lower().startswith(self.MODULUS_PREFIX):
-      raise AvbError('Unexpected modulus output')
-
-    modulus_hexstr = pout[len(self.MODULUS_PREFIX):]
-
-    # The exponent is assumed to always be 65537 and the number of
-    # bits can be derived from the modulus by rounding up to the
-    # nearest power of 2.
+    key = load_rsa_key(key_path, password=_KEY_PASSWORDS.get(key_path))
+    if hasattr(key, 'public_key'):
+      key = key.public_key()
+    numbers = key.public_numbers()
     self.key_path = key_path
-    self.modulus = int(modulus_hexstr, 16)
-    self.num_bits = round_to_pow2(int(math.ceil(math.log(self.modulus, 2))))
-    self.exponent = 65537
+    self.modulus = numbers.n
+    self.num_bits = key.key_size
+    self.exponent = numbers.e
 
   def encode(self):
     """Encodes the public RSA key in |AvbRSAPublicKeyHeader| format.
@@ -423,10 +462,10 @@ class RSAPublicKey(object):
 
   def sign(self, algorithm_name, data_to_sign, signing_helper=None,
            signing_helper_with_files=None):
-    """Sign given data using |signing_helper| or openssl.
+    """Sign given data using an optional external signing helper.
 
-    openssl is used if neither the parameters signing_helper nor
-    signing_helper_with_files are given.
+    The default RSA operation is performed in-process. An external helper is
+    used only when signing_helper or signing_helper_with_files is supplied.
 
     Arguments:
       algorithm_name: The algorithm name as per the ALGORITHMS dict.
@@ -459,6 +498,9 @@ class RSAPublicKey(object):
 
     # Calculates the signature.
     padding_and_hash = algorithm.padding + digest
+    if len(padding_and_hash) != algorithm.signature_num_bytes:
+      raise AvbError('Invalid RSA padding for algorithm {}'.format(
+          algorithm_name))
     p = None
     if signing_helper_with_files is not None:
       with tempfile.NamedTemporaryFile() as signing_file:
@@ -478,17 +520,21 @@ class RSAPublicKey(object):
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE)
+        (pout, perr) = p.communicate(padding_and_hash)
+        retcode = p.wait()
+        if retcode != 0:
+          raise AvbError('Error signing: {}'.format(perr))
+        signature = pout
       else:
-        p = subprocess.Popen(
-            ['openssl', 'rsautl', '-sign', '-inkey', self.key_path, '-raw'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE)
-      (pout, perr) = p.communicate(padding_and_hash)
-      retcode = p.wait()
-      if retcode != 0:
-        raise AvbError('Error signing: {}'.format(perr))
-      signature = pout
+        key = load_rsa_key(self.key_path,
+                           password=_KEY_PASSWORDS.get(self.key_path),
+                           private_only=True)
+        numbers = key.private_numbers()
+        message = int.from_bytes(padding_and_hash, 'big')
+        if message >= numbers.public_numbers.n:
+          raise AvbError('Data to sign is too large for RSA key')
+        signature = pow(message, numbers.d, numbers.public_numbers.n)
+        signature = signature.to_bytes(algorithm.signature_num_bytes, 'big')
     if len(signature) != algorithm.signature_num_bytes:
       raise AvbError('Error signing: Invalid length of signature')
     return signature
@@ -545,8 +591,7 @@ def verify_vbmeta_signature(vbmeta_header, vbmeta_blob):
     public key. Also returns True if the vbmeta blob is not signed.
 
   Raises:
-    AvbError: If there errors calling out to openssl command during
-        signature verification.
+    AvbError: If the embedded signature data is malformed.
   """
   (_, alg) = lookup_algorithm_by_type(vbmeta_header.algorithm_type)
   if not alg.hash_name:
@@ -588,57 +633,16 @@ def verify_vbmeta_signature(vbmeta_header, vbmeta_blob):
   modulus = decode_long(modulus_blob)
   exponent = 65537
 
-  # We used to have this:
-  #
-  #  import Crypto.PublicKey.RSA
-  #  key = Crypto.PublicKey.RSA.construct((modulus, long(exponent)))
-  #  if not key.verify(decode_long(padding_and_digest),
-  #                    (decode_long(sig_blob), None)):
-  #    return False
-  #  return True
-  #
-  # but since 'avbtool verify_image' is used on the builders we don't want
-  # to rely on Crypto.PublicKey.RSA. Instead just use openssl(1) to verify.
-  asn1_str = ('asn1=SEQUENCE:pubkeyinfo\n'
-              '\n'
-              '[pubkeyinfo]\n'
-              'algorithm=SEQUENCE:rsa_alg\n'
-              'pubkey=BITWRAP,SEQUENCE:rsapubkey\n'
-              '\n'
-              '[rsa_alg]\n'
-              'algorithm=OID:rsaEncryption\n'
-              'parameter=NULL\n'
-              '\n'
-              '[rsapubkey]\n'
-              'n=INTEGER:{}\n'
-              'e=INTEGER:{}\n').format(hex(modulus).rstrip('L'),
-                                       hex(exponent).rstrip('L'))
-
-  with tempfile.NamedTemporaryFile() as asn1_tmpfile:
-    asn1_tmpfile.write(asn1_str.encode('ascii'))
-    asn1_tmpfile.flush()
-
-    with tempfile.NamedTemporaryFile() as der_tmpfile:
-      p = subprocess.Popen(
-          ['openssl', 'asn1parse', '-genconf', asn1_tmpfile.name, '-out',
-           der_tmpfile.name, '-noout'])
-      retcode = p.wait()
-      if retcode != 0:
-        raise AvbError('Error generating DER file')
-
-      p = subprocess.Popen(
-          ['openssl', 'rsautl', '-verify', '-pubin', '-inkey', der_tmpfile.name,
-           '-keyform', 'DER', '-raw'],
-          stdin=subprocess.PIPE,
-          stdout=subprocess.PIPE,
-          stderr=subprocess.PIPE)
-      (pout, perr) = p.communicate(sig_blob)
-      retcode = p.wait()
-      if retcode != 0:
-        raise AvbError('Error verifying data: {}'.format(perr))
-      if pout != padding_and_digest:
-        sys.stderr.write('Signature not correct\n')
-        return False
+  # The signature is a raw RSA operation over the AVB PKCS#1 v1.5 block.
+  # Perform the public operation in-process instead of constructing a DER key
+  # and invoking openssl.
+  if len(sig_blob) != num_bits // 8:
+    raise AvbError('Signature length does not match public key size')
+  message = pow(decode_long(sig_blob), exponent, modulus)
+  message_blob = encode_long(num_bits, message)
+  if message_blob != padding_and_digest:
+    sys.stderr.write('Signature not correct\n')
+    return False
   return True
 
 
@@ -3394,8 +3398,7 @@ class Avb(object):
         # size as the hash size. Don't populate a random salt if this
         # descriptor is being created to use a persistent digest on device.
         hash_size = digest_size
-        with open('/dev/urandom', 'rb') as f:
-          salt = f.read(hash_size)
+        salt = os.urandom(hash_size)
       else:
         salt = b''
 
@@ -3631,8 +3634,7 @@ class Avb(object):
         # size as the hash size. Don't populate a random salt if this
         # descriptor is being created to use a persistent digest on device.
         hash_size = digest_size
-        with open('/dev/urandom', 'rb') as f:
-          salt = f.read(hash_size)
+        salt = os.urandom(hash_size)
       else:
         salt = b''
 
@@ -3951,65 +3953,113 @@ def calc_hash_level_offsets(image_size, block_size, digest_size):
 
 
 # See system/extras/libfec/include/fec/io.h for these definitions.
+FEC_BLOCK_SIZE = 4096
+FEC_RSM = 255
 FEC_FOOTER_FORMAT = '<LLLLLQ32s'
 FEC_MAGIC = 0xfecfecfe
 
 
+def _fec_galois_tables():
+  """Builds the GF(2^8) tables used by AOSP's RS(255, N) encoder."""
+  alpha_to = [0] * (FEC_RSM + 1)
+  index_of = [FEC_RSM] * (FEC_RSM + 1)
+  value = 1
+  for index in range(FEC_RSM):
+    index_of[value] = index
+    alpha_to[index] = value
+    value <<= 1
+    if value & 0x100:
+      value ^= 0x11d
+    value &= 0xff
+  alpha_to[FEC_RSM] = 0
+  index_of[0] = FEC_RSM
+  return alpha_to, index_of
+
+
+def _fec_generator(num_roots, alpha_to, index_of):
+  """Build the same generator polynomial as external/fec's init_rs_char."""
+  generator = [0] * (num_roots + 1)
+  generator[0] = 1
+  for i in range(num_roots):
+    root = i
+    generator[i + 1] = 1
+    for j in range(i, 0, -1):
+      if generator[j] != 0:
+        generator[j] = (generator[j - 1] ^
+                        alpha_to[(index_of[generator[j]] + root) % FEC_RSM])
+      else:
+        generator[j] = generator[j - 1]
+    generator[0] = alpha_to[(index_of[generator[0]] + root) % FEC_RSM]
+  return [index_of[value] for value in generator]
+
+
+def _fec_encode_codeword(data, num_roots, alpha_to, index_of, generator):
+  """Encode one shortened RS(255, 255-roots) codeword."""
+  parity = bytearray(num_roots)
+  zero_index = FEC_RSM
+  for value in data:
+    feedback = index_of[value ^ parity[0]]
+    if feedback != zero_index:
+      updated = bytearray(num_roots)
+      for j in range(1, num_roots):
+        updated[j - 1] = (parity[j] ^
+                          alpha_to[(feedback + generator[num_roots - j]) %
+                                   FEC_RSM])
+      updated[num_roots - 1] = alpha_to[(feedback + generator[0]) % FEC_RSM]
+    else:
+      updated = parity[1:] + b'\0'
+    parity = updated
+  return bytes(parity)
+
+
+def _fec_raw_size(image_size, num_roots):
+  """Returns raw FEC bytes for the AOSP image size formula."""
+  if not 0 < num_roots < FEC_RSM:
+    raise ValueError('FEC roots must be between 1 and 254')
+  blocks = (image_size + FEC_BLOCK_SIZE - 1) // FEC_BLOCK_SIZE
+  rounds = (blocks + (FEC_RSM - num_roots) - 1) // (FEC_RSM - num_roots)
+  return rounds * num_roots * FEC_BLOCK_SIZE
+
+
 def calc_fec_data_size(image_size, num_roots):
-  """Calculates how much space FEC data will take.
-
-  Arguments:
-    image_size: The size of the image.
-    num_roots: Number of roots.
-
-  Returns:
-    The number of bytes needed for FEC for an image of the given size
-    and with the requested number of FEC roots.
-
-  Raises:
-    ValueError: If output from the 'fec' tool is invalid.
-  """
-  p = subprocess.Popen(
-      ['fec', '--print-fec-size', str(image_size), '--roots', str(num_roots)],
-      stdout=subprocess.PIPE,
-      stderr=subprocess.PIPE)
-  (pout, perr) = p.communicate()
-  retcode = p.wait()
-  if retcode != 0:
-    raise ValueError('Error invoking fec: {}'.format(perr))
-  return int(pout)
+  """Calculates the AOSP FEC output size, including its 4 KiB header."""
+  return _fec_raw_size(image_size, num_roots) + FEC_BLOCK_SIZE
 
 
 def generate_fec_data(image_filename, num_roots):
-  """Generate FEC codes for an image.
+  """Generate AOSP-compatible FEC codes without an external fec process."""
+  image = ImageHandler(image_filename, read_only=True)
+  image_size = image.image_size
+  if image_size == 0 or image_size % FEC_BLOCK_SIZE:
+    raise ValueError('FEC input size must be a non-zero multiple of 4096')
 
-  Arguments:
-    image_filename: The filename of the image.
-    num_roots: Number of roots.
+  raw_size = _fec_raw_size(image_size, num_roots)
+  rounds = (image_size // FEC_BLOCK_SIZE +
+            (FEC_RSM - num_roots) - 1) // (FEC_RSM - num_roots)
+  rs_n = FEC_RSM - num_roots
+  alpha_to, index_of = _fec_galois_tables()
+  generator = _fec_generator(num_roots, alpha_to, index_of)
 
-  Returns:
-    The FEC data blob as bytes.
+  image.seek(0)
+  data = image.read(image_size)
+  if len(data) != image_size:
+    raise ValueError('Unable to read complete FEC input image')
 
-  Raises:
-    ValueError: If calling the 'fec' tool failed or the output is invalid.
-  """
-  with tempfile.NamedTemporaryFile() as fec_tmpfile:
-    try:
-      subprocess.check_call(
-          ['fec', '--encode', '--roots', str(num_roots), image_filename,
-           fec_tmpfile.name],
-          stderr=open(os.devnull, 'wb'))
-    except subprocess.CalledProcessError as e:
-      raise ValueError('Execution of \'fec\' tool failed: {}.'.format(e))
-    fec_data = fec_tmpfile.read()
-
-  footer_size = struct.calcsize(FEC_FOOTER_FORMAT)
-  footer_data = fec_data[-footer_size:]
-  (magic, _, _, num_roots, fec_size, _, _) = struct.unpack(FEC_FOOTER_FORMAT,
-                                                           footer_data)
-  if magic != FEC_MAGIC:
-    raise ValueError('Unexpected magic in FEC footer')
-  return fec_data[0:fec_size]
+  # AOSP interleaves the image into |rounds * 4096| codewords. Each
+  # codeword contains one byte from each of |rs_n| rows.
+  columns = rounds * FEC_BLOCK_SIZE
+  fec = bytearray(raw_size)
+  for column in range(columns):
+    codeword = (data[column + row * columns] for row in range(rs_n)
+                if column + row * columns < image_size)
+    codeword_data = bytes(codeword)
+    if len(codeword_data) < rs_n:
+      codeword_data += b'\0' * (rs_n - len(codeword_data))
+    parity = _fec_encode_codeword(codeword_data, num_roots, alpha_to,
+                                  index_of, generator)
+    offset = column * num_roots
+    fec[offset:offset + num_roots] = parity
+  return bytes(fec)
 
 
 def generate_hash_tree(image, image_size, block_size, hash_alg_name, salt,
@@ -4203,25 +4253,16 @@ class AvbTool(object):
     return args
 
   def _handle_pass_file(self, args):
-    """Decrypt encrypted key using --pass-file, replace args.key with temp file."""
+    """Loads an encrypted key in-process using --pass-file."""
     pass_file = getattr(args, 'pass_file', None)
     if not pass_file or not args.key:
       return
-    key_path = args.key
-    with open(pass_file, 'r') as f:
-      passphrase = f.read().strip()
-    tmp = tempfile.NamedTemporaryFile(suffix='.key', delete=False)
-    tmp.close()
-    p = subprocess.Popen(
-        ['openssl', 'pkey', '-in', key_path, '-passin', f'pass:{passphrase}',
-         '-out', tmp.name],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    _, perr = p.communicate()
-    if p.wait() != 0:
-      os.unlink(tmp.name)
-      raise AvbError('Failed to decrypt key: {}'.format(perr.decode().strip()))
-    args.key = tmp.name
-    setattr(args, '_avb_tmp_key', tmp.name)
+    try:
+      with open(pass_file, 'r', encoding='utf-8') as f:
+        passphrase = f.read().strip()
+    except OSError as e:
+      raise AvbError('Unable to read passphrase file: {}'.format(e))
+    _KEY_PASSWORDS[args.key] = passphrase
 
   def run(self, argv):
     """Command-line processor.
@@ -4667,7 +4708,6 @@ class AvbTool(object):
     sub_parser.set_defaults(func=self.make_atx_unlock_credential)
 
     args = parser.parse_args(argv[1:])
-    tmp_key = getattr(args, '_avb_tmp_key', None)
     try:
       self._handle_pass_file(args)
       args.func(args)
@@ -4681,8 +4721,8 @@ class AvbTool(object):
       sys.stderr.write('{}: {}\n'.format(argv[0], str(e)))
       sys.exit(1)
     finally:
-      if tmp_key and os.path.exists(tmp_key):
-        os.unlink(tmp_key)
+      if getattr(args, 'key', None):
+        _KEY_PASSWORDS.pop(args.key, None)
 
   def version(self, _):
     """Implements the 'version' sub-command."""
