@@ -26,7 +26,7 @@ python3 -m pip install cryptography
 python3 avbtool.py --help
 ```
 
-可以手动运行 PyInstaller 或 Nuitka 工作流，为 Ubuntu 22.04 amd64 和 arm64 构建独立可执行文件。两个工作流都会打包 `cryptography`。
+手动构建工作流会同时使用 PyInstaller 和 Nuitka，为 Ubuntu 22.04 amd64 和 arm64 构建独立可执行文件。每个产物命名为 `avbtool-mod-<版本号>-<指令集>-<构建方式>-<上海日期>.zip`，其中包含 `avbtool`；两种构建方式都会打包 `cryptography`。
 
 ## 命令树
 

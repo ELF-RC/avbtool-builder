@@ -26,7 +26,7 @@ python3 -m pip install cryptography
 python3 avbtool.py --help
 ```
 
-Standalone executables for Ubuntu 22.04 amd64 and arm64 can be built manually with the PyInstaller or Nuitka workflow. Both workflows bundle `cryptography`.
+The manual build workflow produces Ubuntu 22.04 amd64 and arm64 executables with both PyInstaller and Nuitka. Each artifact is named `avbtool-mod-<version>-<arch>-<builder>-<Shanghai date>.zip` and contains `avbtool`; both builders bundle `cryptography`.
 
 ## Command tree
 
