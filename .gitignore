@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Local / packaging leftovers
+.avbtool-dist/
+dist/
+build/
+build_logs/
+logs/
+*.spec
+EOF
