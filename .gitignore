@@ -13,3 +13,8 @@ build_logs/
 logs/
 *.spec
 EOF
+
+# Vendored AOSP source trees (kept locally, not tracked as gitlinks)
+/fec/
+/openssl/
+
