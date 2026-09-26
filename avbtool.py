@@ -51,11 +51,6 @@ AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED = 1
 # Configuration for enabling logging of calls to avbtool.
 AVB_INVOCATION_LOGFILE = os.environ.get('AVB_INVOCATION_LOGFILE')
 
-# Passwords supplied with --pass-file are kept only for this invocation and
-# consumed by the in-process RSA loader. The key material itself is never
-# written to a decrypted temporary file.
-_KEY_PASSWORDS = {}
-
 
 class AvbError(Exception):
   """Application-specific errors.
@@ -340,80 +335,6 @@ def parse_number(string):
   return int(string, 0)
 
 
-def _binary_stdout():
-  """Return a binary handle for commands that default to stdout.
-
-  argparse.FileType('wb') cannot use sys.stdout on Python 3 because
-  stdout is a text stream. Use the underlying buffer when available.
-  """
-  return getattr(sys.stdout, 'buffer', sys.stdout)
-
-
-def load_rsa_key(key_path, password=None, private_only=False):
-  """Loads an RSA key using the bundled cryptography implementation.
-
-  The old implementation delegated PEM/DER parsing to openssl. Keeping the
-  parser in-process means the frozen avbtool does not need an openssl binary.
-
-  Args:
-    key_path: Path to a PEM or DER RSA key.
-    password: Optional password for an encrypted private key.
-    private_only: Require a private key instead of accepting a public key.
-
-  Returns:
-    An ``RSAPrivateKey`` or ``RSAPublicKey`` instance.
-
-  Raises:
-    AvbError: If cryptography is unavailable or the key cannot be loaded.
-  """
-  try:
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-  except ImportError as e:
-    raise AvbError('The bundled cryptography package is unavailable: {}'
-                   .format(e))
-
-  try:
-    with open(key_path, 'rb') as key_file:
-      key_data = key_file.read()
-  except OSError as e:
-    raise AvbError('Unable to read RSA key {}: {}'.format(key_path, e))
-
-  password_bytes = None if password is None else password.encode('utf-8')
-  errors = []
-  key = None
-
-  private_loaders = (serialization.load_pem_private_key,
-                     serialization.load_der_private_key)
-  public_loaders = (serialization.load_pem_public_key,
-                    serialization.load_der_public_key)
-
-  for loader in private_loaders:
-    try:
-      key = loader(key_data, password=password_bytes)
-      break
-    except (TypeError, ValueError) as e:
-      errors.append(str(e))
-
-  if key is None and not private_only and password is None:
-    for loader in public_loaders:
-      try:
-        key = loader(key_data)
-        break
-      except (TypeError, ValueError) as e:
-        errors.append(str(e))
-
-  if key is None:
-    detail = errors[-1] if errors else 'unsupported key format'
-    raise AvbError('Unable to load RSA key {}: {}'.format(key_path, detail))
-
-  if not isinstance(key, (rsa.RSAPrivateKey, rsa.RSAPublicKey)):
-    raise AvbError('Key {} is not an RSA key'.format(key_path))
-  if private_only and not isinstance(key, rsa.RSAPrivateKey):
-    raise AvbError('Private RSA key required: {}'.format(key_path))
-  return key
-
-
 class RSAPublicKey(object):
   """Data structure used for a RSA public key.
 
@@ -434,14 +355,45 @@ class RSAPublicKey(object):
     Raises:
       AvbError: If RSA key parameters could not be read from file.
     """
-    key = load_rsa_key(key_path, password=_KEY_PASSWORDS.get(key_path))
-    if hasattr(key, 'public_key'):
-      key = key.public_key()
-    numbers = key.public_numbers()
+    # We used to have something as simple as this:
+    #
+    #  key = Crypto.PublicKey.RSA.importKey(open(key_path).read())
+    #  self.exponent = key.e
+    #  self.modulus = key.n
+    #  self.num_bits = key.size() + 1
+    #
+    # but unfortunately PyCrypto is not available in the builder. So
+    # instead just parse openssl(1) output to get this
+    # information. It's ugly but...
+    args = ['openssl', 'rsa', '-in', key_path, '-modulus', '-noout']
+    p = subprocess.Popen(args,
+                         stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+    (pout, perr) = p.communicate()
+    if p.wait() != 0:
+      # Could be just a public key is passed, try that.
+      args.append('-pubin')
+      p = subprocess.Popen(args,
+                           stdin=subprocess.PIPE,
+                           stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
+      (pout, perr) = p.communicate()
+      if p.wait() != 0:
+        raise AvbError('Error getting public key: {}'.format(perr))
+
+    if not pout.lower().startswith(self.MODULUS_PREFIX):
+      raise AvbError('Unexpected modulus output')
+
+    modulus_hexstr = pout[len(self.MODULUS_PREFIX):]
+
+    # The exponent is assumed to always be 65537 and the number of
+    # bits can be derived from the modulus by rounding up to the
+    # nearest power of 2.
     self.key_path = key_path
-    self.modulus = numbers.n
-    self.num_bits = key.key_size
-    self.exponent = numbers.e
+    self.modulus = int(modulus_hexstr, 16)
+    self.num_bits = round_to_pow2(int(math.ceil(math.log(self.modulus, 2))))
+    self.exponent = 65537
 
   def encode(self):
     """Encodes the public RSA key in |AvbRSAPublicKeyHeader| format.
@@ -471,10 +423,10 @@ class RSAPublicKey(object):
 
   def sign(self, algorithm_name, data_to_sign, signing_helper=None,
            signing_helper_with_files=None):
-    """Sign given data using an optional external signing helper.
+    """Sign given data using |signing_helper| or openssl.
 
-    The default RSA operation is performed in-process. An external helper is
-    used only when signing_helper or signing_helper_with_files is supplied.
+    openssl is used if neither the parameters signing_helper nor
+    signing_helper_with_files are given.
 
     Arguments:
       algorithm_name: The algorithm name as per the ALGORITHMS dict.
@@ -507,9 +459,6 @@ class RSAPublicKey(object):
 
     # Calculates the signature.
     padding_and_hash = algorithm.padding + digest
-    if len(padding_and_hash) != algorithm.signature_num_bytes:
-      raise AvbError('Invalid RSA padding for algorithm {}'.format(
-          algorithm_name))
     p = None
     if signing_helper_with_files is not None:
       with tempfile.NamedTemporaryFile() as signing_file:
@@ -529,21 +478,17 @@ class RSAPublicKey(object):
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE)
-        (pout, perr) = p.communicate(padding_and_hash)
-        retcode = p.wait()
-        if retcode != 0:
-          raise AvbError('Error signing: {}'.format(perr))
-        signature = pout
       else:
-        key = load_rsa_key(self.key_path,
-                           password=_KEY_PASSWORDS.get(self.key_path),
-                           private_only=True)
-        numbers = key.private_numbers()
-        message = int.from_bytes(padding_and_hash, 'big')
-        if message >= numbers.public_numbers.n:
-          raise AvbError('Data to sign is too large for RSA key')
-        signature = pow(message, numbers.d, numbers.public_numbers.n)
-        signature = signature.to_bytes(algorithm.signature_num_bytes, 'big')
+        p = subprocess.Popen(
+            ['openssl', 'rsautl', '-sign', '-inkey', self.key_path, '-raw'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+      (pout, perr) = p.communicate(padding_and_hash)
+      retcode = p.wait()
+      if retcode != 0:
+        raise AvbError('Error signing: {}'.format(perr))
+      signature = pout
     if len(signature) != algorithm.signature_num_bytes:
       raise AvbError('Error signing: Invalid length of signature')
     return signature
@@ -600,7 +545,8 @@ def verify_vbmeta_signature(vbmeta_header, vbmeta_blob):
     public key. Also returns True if the vbmeta blob is not signed.
 
   Raises:
-    AvbError: If the embedded signature data is malformed.
+    AvbError: If there errors calling out to openssl command during
+        signature verification.
   """
   (_, alg) = lookup_algorithm_by_type(vbmeta_header.algorithm_type)
   if not alg.hash_name:
@@ -642,16 +588,57 @@ def verify_vbmeta_signature(vbmeta_header, vbmeta_blob):
   modulus = decode_long(modulus_blob)
   exponent = 65537
 
-  # The signature is a raw RSA operation over the AVB PKCS#1 v1.5 block.
-  # Perform the public operation in-process instead of constructing a DER key
-  # and invoking openssl.
-  if len(sig_blob) != num_bits // 8:
-    raise AvbError('Signature length does not match public key size')
-  message = pow(decode_long(sig_blob), exponent, modulus)
-  message_blob = encode_long(num_bits, message)
-  if message_blob != padding_and_digest:
-    sys.stderr.write('Signature not correct\n')
-    return False
+  # We used to have this:
+  #
+  #  import Crypto.PublicKey.RSA
+  #  key = Crypto.PublicKey.RSA.construct((modulus, long(exponent)))
+  #  if not key.verify(decode_long(padding_and_digest),
+  #                    (decode_long(sig_blob), None)):
+  #    return False
+  #  return True
+  #
+  # but since 'avbtool verify_image' is used on the builders we don't want
+  # to rely on Crypto.PublicKey.RSA. Instead just use openssl(1) to verify.
+  asn1_str = ('asn1=SEQUENCE:pubkeyinfo\n'
+              '\n'
+              '[pubkeyinfo]\n'
+              'algorithm=SEQUENCE:rsa_alg\n'
+              'pubkey=BITWRAP,SEQUENCE:rsapubkey\n'
+              '\n'
+              '[rsa_alg]\n'
+              'algorithm=OID:rsaEncryption\n'
+              'parameter=NULL\n'
+              '\n'
+              '[rsapubkey]\n'
+              'n=INTEGER:{}\n'
+              'e=INTEGER:{}\n').format(hex(modulus).rstrip('L'),
+                                       hex(exponent).rstrip('L'))
+
+  with tempfile.NamedTemporaryFile() as asn1_tmpfile:
+    asn1_tmpfile.write(asn1_str.encode('ascii'))
+    asn1_tmpfile.flush()
+
+    with tempfile.NamedTemporaryFile() as der_tmpfile:
+      p = subprocess.Popen(
+          ['openssl', 'asn1parse', '-genconf', asn1_tmpfile.name, '-out',
+           der_tmpfile.name, '-noout'])
+      retcode = p.wait()
+      if retcode != 0:
+        raise AvbError('Error generating DER file')
+
+      p = subprocess.Popen(
+          ['openssl', 'rsautl', '-verify', '-pubin', '-inkey', der_tmpfile.name,
+           '-keyform', 'DER', '-raw'],
+          stdin=subprocess.PIPE,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.PIPE)
+      (pout, perr) = p.communicate(sig_blob)
+      retcode = p.wait()
+      if retcode != 0:
+        raise AvbError('Error verifying data: {}'.format(perr))
+      if pout != padding_and_digest:
+        sys.stderr.write('Signature not correct\n')
+        return False
   return True
 
 
@@ -3301,7 +3288,7 @@ class Avb(object):
                       release_string, append_to_release_string,
                       output_vbmeta_image, do_not_append_vbmeta_image,
                       print_required_libavb_version, use_persistent_digest,
-                      do_not_use_ab, dynamic_partition_size=False):
+                      do_not_use_ab):
     """Implementation of the add_hash_footer on unsparse images.
 
     Arguments:
@@ -3336,9 +3323,6 @@ class Avb(object):
       print_required_libavb_version: True to only print required libavb version.
       use_persistent_digest: Use a persistent digest on device.
       do_not_use_ab: This partition does not use A/B.
-      dynamic_partition_size: If True, derive partition_size from the
-        image so the footer is placed immediately after the image and
-        metadata.
 
     Raises:
       AvbError: If an argument is incorrect of if adding of hash_footer failed.
@@ -3354,33 +3338,24 @@ class Avb(object):
       print('1.{}'.format(required_libavb_version_minor))
       return
 
-    if not image_filename and not calc_max_image_size:
-      raise AvbError('No image file given')
-    if dynamic_partition_size and calc_max_image_size:
-      raise AvbError('--calc_max_image_size cannot be used with '
-                     '--dynamic_partition_size.')
-    if dynamic_partition_size and partition_size:
-      raise AvbError('--partition_size cannot be used with '
-                     '--dynamic_partition_size.')
-
     # First, calculate the maximum image size such that an image
     # this size + metadata (footer + vbmeta struct) fits in
     # |partition_size|.
     max_metadata_size = self.MAX_VBMETA_SIZE + self.MAX_FOOTER_SIZE
-    if not dynamic_partition_size:
-      if partition_size < max_metadata_size:
-        raise AvbError('Parition size of {} is too small. '
-                       'Needs to be at least {}'.format(
-                           partition_size, max_metadata_size))
-      max_image_size = partition_size - max_metadata_size
-      if calc_max_image_size:
-        print('{}'.format(max_image_size))
-        return
+    if partition_size < max_metadata_size:
+      raise AvbError('Parition size of {} is too small. '
+                     'Needs to be at least {}'.format(
+                         partition_size, max_metadata_size))
+    max_image_size = partition_size - max_metadata_size
+
+    # If we're asked to only calculate the maximum image size, we're done.
+    if calc_max_image_size:
+      print('{}'.format(max_image_size))
+      return
 
     image = ImageHandler(image_filename)
 
-    if (not dynamic_partition_size and
-        partition_size % image.block_size != 0):
+    if partition_size % image.block_size != 0:
       raise AvbError('Partition size of {} is not a multiple of the image '
                      'block size {}.'.format(partition_size,
                                              image.block_size))
@@ -3401,15 +3376,6 @@ class Avb(object):
       # Image size is too small to possibly contain a footer.
       original_image_size = image.image_size
 
-    if dynamic_partition_size:
-      partition_size = round_to_multiple(
-          image.image_size + max_metadata_size, image.block_size)
-      if partition_size < max_metadata_size:
-        raise AvbError('Parition size of {} is too small. '
-                       'Needs to be at least {}'.format(
-                           partition_size, max_metadata_size))
-      max_image_size = partition_size - max_metadata_size
-
     # If anything goes wrong from here-on, restore the image back to
     # its original size.
     try:
@@ -3428,7 +3394,8 @@ class Avb(object):
         # size as the hash size. Don't populate a random salt if this
         # descriptor is being created to use a persistent digest on device.
         hash_size = digest_size
-        salt = os.urandom(hash_size)
+        with open('/dev/urandom', 'rb') as f:
+          salt = f.read(hash_size)
       else:
         salt = b''
 
@@ -3526,7 +3493,7 @@ class Avb(object):
                           output_vbmeta_image, do_not_append_vbmeta_image,
                           print_required_libavb_version,
                           use_persistent_root_digest, do_not_use_ab,
-                          no_hashtree, dynamic_partition_size=False):
+                          no_hashtree):
     """Implements the 'add_hashtree_footer' command.
 
     See https://gitlab.com/cryptsetup/cryptsetup/wikis/DMVerity for
@@ -3570,8 +3537,6 @@ class Avb(object):
       use_persistent_root_digest: Use a persistent root digest on device.
       do_not_use_ab: The partition does not use A/B.
       no_hashtree: Do not append hashtree. Set size in descriptor as zero.
-      dynamic_partition_size: If True, grow partition_size so the
-        hashtree, FEC, and footer sit immediately after the image.
 
     Raises:
       AvbError: If an argument is incorrect or adding the hashtree footer
@@ -3587,15 +3552,6 @@ class Avb(object):
     if print_required_libavb_version:
       print('1.{}'.format(required_libavb_version_minor))
       return
-
-    if not image_filename and not calc_max_image_size:
-      raise AvbError('No image file given')
-    if dynamic_partition_size and calc_max_image_size:
-      raise AvbError('--calc_max_image_size cannot be used with '
-                     '--dynamic_partition_size.')
-    if dynamic_partition_size and partition_size:
-      raise AvbError('--partition_size cannot be used with '
-                     '--dynamic_partition_size.')
 
     digest_size = len(hashlib.new(hash_algorithm).digest())
     digest_padding = round_to_pow2(digest_size) - digest_size
@@ -3631,7 +3587,7 @@ class Avb(object):
         raise AvbError('Partition size of {} is not a multiple of the image '
                        'block size {}.'.format(partition_size,
                                                image.block_size))
-    elif not dynamic_partition_size and image.image_size % image.block_size != 0:
+    elif image.image_size % image.block_size != 0:
       raise AvbError('File size of {} is not a multiple of the image '
                      'block size {}.'.format(image.image_size,
                                              image.block_size))
@@ -3655,27 +3611,10 @@ class Avb(object):
     # If anything goes wrong from here-on, restore the image back to
     # its original size.
     try:
-      # Ensure image is multiple of block_size. append_raw() requires a
-      # block-aligned payload, so grow the unsparse file instead.
+      # Ensure image is multiple of block_size.
       rounded_image_size = round_to_multiple(image.image_size, block_size)
       if rounded_image_size > image.image_size:
-        image.truncate(rounded_image_size)
-
-      if dynamic_partition_size:
-        # Grow the partition just enough for the hashtree, FEC, and
-        # conservative vbmeta/footer estimate after padding the image.
-        tree_for_size = 0
-        fec_for_size = 0
-        if not no_hashtree:
-          (_, tree_for_size) = calc_hash_level_offsets(
-              image.image_size, block_size, digest_size + digest_padding)
-          if generate_fec:
-            fec_for_size = calc_fec_data_size(
-                image.image_size + tree_for_size, fec_num_roots)
-        partition_size = round_to_multiple(
-            image.image_size + tree_for_size + fec_for_size +
-            self.MAX_VBMETA_SIZE + self.MAX_FOOTER_SIZE, image.block_size)
-        max_image_size = image.image_size
+        image.append_raw('\0' * (rounded_image_size - image.image_size))
 
       # If image size exceeds the maximum image size, fail.
       if partition_size > 0:
@@ -3692,7 +3631,8 @@ class Avb(object):
         # size as the hash size. Don't populate a random salt if this
         # descriptor is being created to use a persistent digest on device.
         hash_size = digest_size
-        salt = os.urandom(hash_size)
+        with open('/dev/urandom', 'rb') as f:
+          salt = f.read(hash_size)
       else:
         salt = b''
 
@@ -3737,13 +3677,6 @@ class Avb(object):
       if not use_persistent_root_digest:
         ht_desc.root_digest = root_digest
 
-      # Generate FEC over the image plus hashtree before either is
-      # written past the original payload. AOSP's fec tool covers this
-      # same range and appends a 4 KiB footer after the RS bytes.
-      fec_data = b''
-      if generate_fec and not no_hashtree:
-        fec_data = generate_fec_data(image, fec_num_roots, extra_data=hash_tree)
-
       # Write the hash tree
       padding_needed = (round_to_multiple(len(hash_tree), image.block_size) -
                         len(hash_tree))
@@ -3753,6 +3686,10 @@ class Avb(object):
 
       # Generate FEC codes, if requested.
       if generate_fec:
+        if no_hashtree:
+          fec_data = b''
+        else:
+          fec_data = generate_fec_data(image_filename, fec_num_roots)
         padding_needed = (round_to_multiple(len(fec_data), image.block_size) -
                           len(fec_data))
         fec_data_with_padding = fec_data + b'\0' * padding_needed
@@ -4014,147 +3951,65 @@ def calc_hash_level_offsets(image_size, block_size, digest_size):
 
 
 # See system/extras/libfec/include/fec/io.h for these definitions.
-FEC_BLOCK_SIZE = 4096
-FEC_RSM = 255
 FEC_FOOTER_FORMAT = '<LLLLLQ32s'
 FEC_MAGIC = 0xfecfecfe
 
 
-def _fec_galois_tables():
-  """Builds the GF(2^8) tables used by AOSP's RS(255, N) encoder."""
-  alpha_to = [0] * (FEC_RSM + 1)
-  index_of = [FEC_RSM] * (FEC_RSM + 1)
-  value = 1
-  for index in range(FEC_RSM):
-    index_of[value] = index
-    alpha_to[index] = value
-    value <<= 1
-    if value & 0x100:
-      value ^= 0x11d
-    value &= 0xff
-  alpha_to[FEC_RSM] = 0
-  index_of[0] = FEC_RSM
-  return alpha_to, index_of
-
-
-def _fec_generator(num_roots, alpha_to, index_of):
-  """Build the same generator polynomial as external/fec's init_rs_char."""
-  generator = [0] * (num_roots + 1)
-  generator[0] = 1
-  for i in range(num_roots):
-    root = i
-    generator[i + 1] = 1
-    for j in range(i, 0, -1):
-      if generator[j] != 0:
-        generator[j] = (generator[j - 1] ^
-                        alpha_to[(index_of[generator[j]] + root) % FEC_RSM])
-      else:
-        generator[j] = generator[j - 1]
-    generator[0] = alpha_to[(index_of[generator[0]] + root) % FEC_RSM]
-  return [index_of[value] for value in generator]
-
-
-def _fec_encode_codeword(data, num_roots, alpha_to, index_of, generator):
-  """Encode one shortened RS(255, 255-roots) codeword."""
-  parity = bytearray(num_roots)
-  zero_index = FEC_RSM
-  for value in data:
-    feedback = index_of[value ^ parity[0]]
-    if feedback != zero_index:
-      updated = bytearray(num_roots)
-      for j in range(1, num_roots):
-        updated[j - 1] = (parity[j] ^
-                          alpha_to[(feedback + generator[num_roots - j]) %
-                                   FEC_RSM])
-      updated[num_roots - 1] = alpha_to[(feedback + generator[0]) % FEC_RSM]
-    else:
-      updated = parity[1:] + b'\0'
-    parity = updated
-  return bytes(parity)
-
-
-def _fec_raw_size(image_size, num_roots):
-  """Returns raw FEC bytes for the AOSP image size formula."""
-  if not 0 < num_roots < FEC_RSM:
-    raise ValueError('FEC roots must be between 1 and 254')
-  blocks = (image_size + FEC_BLOCK_SIZE - 1) // FEC_BLOCK_SIZE
-  rounds = (blocks + (FEC_RSM - num_roots) - 1) // (FEC_RSM - num_roots)
-  return rounds * num_roots * FEC_BLOCK_SIZE
-
-
 def calc_fec_data_size(image_size, num_roots):
-  """Calculates the AOSP FEC output size, including its 4 KiB header."""
-  return _fec_raw_size(image_size, num_roots) + FEC_BLOCK_SIZE
-
-
-def generate_fec_data(image, num_roots, extra_data=b''):
-  """Generate AOSP-compatible FEC codes without an external fec process.
+  """Calculates how much space FEC data will take.
 
   Arguments:
-    image: Path or ImageHandler covering the payload to protect.
-    num_roots: Number of RS roots (parity bytes per codeword).
-    extra_data: Optional extra bytes appended to the image, typically
-      the hashtree. AOSP's fec tool covers image + hashtree.
+    image_size: The size of the image.
+    num_roots: Number of roots.
 
   Returns:
-    FEC bytes including the 4 KiB AOSP footer.
+    The number of bytes needed for FEC for an image of the given size
+    and with the requested number of FEC roots.
+
+  Raises:
+    ValueError: If output from the 'fec' tool is invalid.
   """
-  if isinstance(image, ImageHandler):
-    source = image
-    image_size = source.image_size
-    source.seek(0)
-    data = source.read(image_size)
-  else:
-    source = ImageHandler(image, read_only=True)
-    image_size = source.image_size
-    source.seek(0)
-    data = source.read(image_size)
-  if extra_data:
-    data += extra_data
-    image_size = len(data)
-  if image_size == 0 or image_size % FEC_BLOCK_SIZE:
-    raise ValueError('FEC input size must be a non-zero multiple of 4096')
-  if len(data) != image_size:
-    raise ValueError('Unable to read complete FEC input image')
+  p = subprocess.Popen(
+      ['fec', '--print-fec-size', str(image_size), '--roots', str(num_roots)],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.PIPE)
+  (pout, perr) = p.communicate()
+  retcode = p.wait()
+  if retcode != 0:
+    raise ValueError('Error invoking fec: {}'.format(perr))
+  return int(pout)
 
-  raw_size = _fec_raw_size(image_size, num_roots)
-  rounds = (image_size // FEC_BLOCK_SIZE +
-            (FEC_RSM - num_roots) - 1) // (FEC_RSM - num_roots)
-  rs_n = FEC_RSM - num_roots
-  alpha_to, index_of = _fec_galois_tables()
-  generator = _fec_generator(num_roots, alpha_to, index_of)
 
-  # AOSP interleaves the image into |rounds * 4096| codewords. Each
-  # codeword contains one byte from each of |rs_n| rows.
-  columns = rounds * FEC_BLOCK_SIZE
-  fec = bytearray(raw_size)
-  for column in range(columns):
-    codeword = (data[column + row * columns] for row in range(rs_n)
-                if column + row * columns < image_size)
-    codeword_data = bytes(codeword)
-    if len(codeword_data) < rs_n:
-      codeword_data += b'\0' * (rs_n - len(codeword_data))
-    parity = _fec_encode_codeword(codeword_data, num_roots, alpha_to,
-                                  index_of, generator)
-    offset = column * num_roots
-    fec[offset:offset + num_roots] = parity
+def generate_fec_data(image_filename, num_roots):
+  """Generate FEC codes for an image.
 
-  # libfec stores a 4 KiB footer after the RS bytes. Fields match
-  # system/extras/libfec/include/fec/io.h (fec_header).
-  fec_hash = hashlib.sha256(bytes(fec)).digest()
-  header = struct.pack(
-      FEC_FOOTER_FORMAT,
-      FEC_MAGIC,
-      0,  # version
-      FEC_BLOCK_SIZE,
-      num_roots,
-      raw_size,
-      image_size,
-      fec_hash)
-  if len(header) > FEC_BLOCK_SIZE:
-    raise ValueError('FEC footer exceeds one block')
-  footer = header + b'\0' * (FEC_BLOCK_SIZE - len(header))
-  return bytes(fec) + footer
+  Arguments:
+    image_filename: The filename of the image.
+    num_roots: Number of roots.
+
+  Returns:
+    The FEC data blob as bytes.
+
+  Raises:
+    ValueError: If calling the 'fec' tool failed or the output is invalid.
+  """
+  with tempfile.NamedTemporaryFile() as fec_tmpfile:
+    try:
+      subprocess.check_call(
+          ['fec', '--encode', '--roots', str(num_roots), image_filename,
+           fec_tmpfile.name],
+          stderr=open(os.devnull, 'wb'))
+    except subprocess.CalledProcessError as e:
+      raise ValueError('Execution of \'fec\' tool failed: {}.'.format(e))
+    fec_data = fec_tmpfile.read()
+
+  footer_size = struct.calcsize(FEC_FOOTER_FORMAT)
+  footer_data = fec_data[-footer_size:]
+  (magic, _, _, num_roots, fec_size, _, _) = struct.unpack(FEC_FOOTER_FORMAT,
+                                                           footer_data)
+  if magic != FEC_MAGIC:
+    raise ValueError('Unexpected magic in FEC footer')
+  return fec_data[0:fec_size]
 
 
 def generate_hash_tree(image, image_size, block_size, hash_alg_name, salt,
@@ -4311,9 +4166,6 @@ class AvbTool(object):
     sub_parser.add_argument('--set_hashtree_disabled_flag',
                             help='Set the HASHTREE_DISABLED flag',
                             action='store_true')
-    sub_parser.add_argument('--pass-file',
-                            help='File containing RSA private key passphrase',
-                            metavar='FILE')
 
   def _add_common_footer_args(self, sub_parser):
     """Adds arguments used by add_*_footer sub-commands.
@@ -4347,18 +4199,6 @@ class AvbTool(object):
       args.flags |= AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED
     return args
 
-  def _handle_pass_file(self, args):
-    """Loads an encrypted key in-process using --pass-file."""
-    pass_file = getattr(args, 'pass_file', None)
-    if not pass_file or not args.key:
-      return
-    try:
-      with open(pass_file, 'r', encoding='utf-8') as f:
-        passphrase = f.read().strip()
-    except OSError as e:
-      raise AvbError('Unable to read passphrase file: {}'.format(e))
-    _KEY_PASSWORDS[args.key] = passphrase
-
   def run(self, argv):
     """Command-line processor.
 
@@ -4383,7 +4223,7 @@ class AvbTool(object):
     sub_parser.add_argument('--output',
                             help='Output file name.',
                             type=argparse.FileType('wb'),
-                            default=_binary_stdout())
+                            default=sys.stdout)
     sub_parser.set_defaults(func=self.generate_test_image)
 
     sub_parser = subparsers.add_parser('version',
@@ -4399,9 +4239,6 @@ class AvbTool(object):
                             help='Output file name',
                             type=argparse.FileType('wb'),
                             required=True)
-    sub_parser.add_argument('--pass-file',
-                            help='File containing RSA private key passphrase',
-                            metavar='FILE')
     sub_parser.set_defaults(func=self.extract_public_key)
 
     sub_parser = subparsers.add_parser('make_vbmeta_image',
@@ -4425,13 +4262,8 @@ class AvbTool(object):
                             help='Image to add hashes to',
                             type=argparse.FileType('rb+'))
     sub_parser.add_argument('--partition_size',
-                            help='Partition size (0 for dynamic partition auto-calc)',
-                            type=parse_number,
-                            default=0)
-    sub_parser.add_argument('--dynamic_partition_size',
-                            help='Automatically calculate partition size',
-                            action='store_true',
-                            dest='dynamic_partition_size')
+                            help='Partition size',
+                            type=parse_number)
     sub_parser.add_argument('--partition_name',
                             help='Partition name',
                             default=None)
@@ -4461,16 +4293,14 @@ class AvbTool(object):
                                        help='Append vbmeta image to image.')
     sub_parser.add_argument('--image',
                             help='Image to append vbmeta blob to',
-                            type=argparse.FileType('rb+'),
-                            required=True)
+                            type=argparse.FileType('rb+'))
     sub_parser.add_argument('--partition_size',
                             help='Partition size',
                             type=parse_number,
                             required=True)
     sub_parser.add_argument('--vbmeta_image',
                             help='Image with vbmeta blob to append',
-                            type=argparse.FileType('rb'),
-                            required=True)
+                            type=argparse.FileType('rb'))
     sub_parser.set_defaults(func=self.append_vbmeta_image)
 
     sub_parser = subparsers.add_parser(
@@ -4480,19 +4310,15 @@ class AvbTool(object):
                             help='Image to add hashtree to',
                             type=argparse.FileType('rb+'))
     sub_parser.add_argument('--partition_size',
-                            help='Partition size (0 for dynamic partition auto-calc)',
+                            help='Partition size',
                             default=0,
                             type=parse_number)
-    sub_parser.add_argument('--dynamic_partition_size',
-                            help='Automatically calculate partition size',
-                            action='store_true',
-                            dest='dynamic_partition_size')
     sub_parser.add_argument('--partition_name',
                             help='Partition name',
                             default='')
     sub_parser.add_argument('--hash_algorithm',
-                            help='Hash algorithm to use (default: sha256)',
-                            default='sha256')
+                            help='Hash algorithm to use (default: sha1)',
+                            default='sha1')
     sub_parser.add_argument('--salt',
                             help='Salt in hex (default: /dev/urandom)')
     sub_parser.add_argument('--block_size',
@@ -4570,8 +4396,7 @@ class AvbTool(object):
                             required=True)
     sub_parser.add_argument('--output',
                             help='Output file name',
-                            type=argparse.FileType('wb'),
-                            default=_binary_stdout())
+                            type=argparse.FileType('wb'))
     sub_parser.add_argument('--padding_size',
                             metavar='NUMBER',
                             help='If non-zero, pads output with NUL bytes so '
@@ -4589,8 +4414,7 @@ class AvbTool(object):
                             required=True)
     sub_parser.add_argument('--partition_size',
                             help='New partition size',
-                            type=parse_number,
-                            required=True)
+                            type=parse_number)
     sub_parser.set_defaults(func=self.resize_image)
 
     sub_parser = subparsers.add_parser(
@@ -4617,9 +4441,6 @@ class AvbTool(object):
                             help='Check embedded public key matches KEY',
                             metavar='KEY',
                             required=False)
-    sub_parser.add_argument('--pass-file',
-                            help='File containing RSA private key passphrase',
-                            metavar='FILE')
     sub_parser.add_argument('--expected_chain_partition',
                             help='Expected chain partition',
                             metavar='PART_NAME:ROLLBACK_SLOT:KEY_PATH',
@@ -4688,6 +4509,7 @@ class AvbTool(object):
     sub_parser.add_argument('--misc_image',
                             help=('The misc image to modify. If the image does '
                                   'not exist, it will be created.'),
+                            type=argparse.FileType('r+b'),
                             required=True)
     sub_parser.add_argument('--slot_data',
                             help=('Slot data of the form "priority", '
@@ -4704,7 +4526,7 @@ class AvbTool(object):
     sub_parser.add_argument('--output',
                             help='Write certificate to file',
                             type=argparse.FileType('wb'),
-                            default=_binary_stdout())
+                            default=sys.stdout)
     sub_parser.add_argument('--subject',
                             help=('Path to subject file'),
                             type=argparse.FileType('rb'),
@@ -4746,7 +4568,7 @@ class AvbTool(object):
     sub_parser.add_argument('--output',
                             help='Write attributes to file',
                             type=argparse.FileType('wb'),
-                            default=_binary_stdout())
+                            default=sys.stdout)
     sub_parser.add_argument('--root_authority_key',
                             help='Path to authority RSA public key file',
                             type=argparse.FileType('rb'),
@@ -4763,7 +4585,7 @@ class AvbTool(object):
     sub_parser.add_argument('--output',
                             help='Write metadata to file',
                             type=argparse.FileType('wb'),
-                            default=_binary_stdout())
+                            default=sys.stdout)
     sub_parser.add_argument('--intermediate_key_certificate',
                             help='Path to intermediate key certificate file',
                             type=argparse.FileType('rb'),
@@ -4780,7 +4602,7 @@ class AvbTool(object):
     sub_parser.add_argument('--output',
                             help='Write credential to file',
                             type=argparse.FileType('wb'),
-                            default=_binary_stdout())
+                            default=sys.stdout)
     sub_parser.add_argument('--intermediate_key_certificate',
                             help='Path to intermediate key certificate file',
                             type=argparse.FileType('rb'),
@@ -4813,18 +4635,16 @@ class AvbTool(object):
 
     args = parser.parse_args(argv[1:])
     try:
-      self._handle_pass_file(args)
-      if not hasattr(args, 'func'):
-        parser.print_usage()
-        print('avbtool: error: too few arguments')
-        sys.exit(2)
       args.func(args)
+    except AttributeError:
+      # This error gets raised when the command line tool is called without any
+      # arguments. It mimics the original Python 2 behavior.
+      parser.print_usage()
+      print('avbtool: error: too few arguments')
+      sys.exit(2)
     except AvbError as e:
       sys.stderr.write('{}: {}\n'.format(argv[0], str(e)))
       sys.exit(1)
-    finally:
-      if getattr(args, 'key', None):
-        _KEY_PASSWORDS.pop(args.key, None)
 
   def version(self, _):
     """Implements the 'version' sub-command."""
@@ -4884,8 +4704,7 @@ class AvbTool(object):
                              args.do_not_append_vbmeta_image,
                              args.print_required_libavb_version,
                              args.use_persistent_digest,
-                             args.do_not_use_ab,
-                             args.dynamic_partition_size)
+                             args.do_not_use_ab)
 
   def add_hashtree_footer(self, args):
     """Implements the 'add_hashtree_footer' sub-command."""
@@ -4921,8 +4740,7 @@ class AvbTool(object):
         args.print_required_libavb_version,
         args.use_persistent_digest,
         args.do_not_use_ab,
-        args.no_hashtree,
-        args.dynamic_partition_size)
+        args.no_hashtree)
 
   def erase_footer(self, args):
     """Implements the 'erase_footer' sub-command."""
@@ -4943,15 +4761,7 @@ class AvbTool(object):
 
   def set_ab_metadata(self, args):
     """Implements the 'set_ab_metadata' sub-command."""
-    misc_path = args.misc_image
-    created = not os.path.exists(misc_path)
-    mode = 'w+b' if created else 'r+b'
-    with open(misc_path, mode) as misc_image:
-      if created:
-        # A/B metadata lives at offset 2048 plus a 28-byte record.
-        misc_image.write(b'\0' * (self.avb.AB_MISC_METADATA_OFFSET + 64))
-        misc_image.seek(0)
-      self.avb.set_ab_metadata(misc_image, args.slot_data)
+    self.avb.set_ab_metadata(args.misc_image, args.slot_data)
 
   def info_image(self, args):
     """Implements the 'info_image' sub-command."""
