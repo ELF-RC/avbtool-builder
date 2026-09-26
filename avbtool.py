@@ -27,7 +27,6 @@
 import argparse
 import binascii
 import bisect
-import concurrent.futures
 import hashlib
 import json
 import math
@@ -3527,8 +3526,7 @@ class Avb(object):
                           output_vbmeta_image, do_not_append_vbmeta_image,
                           print_required_libavb_version,
                           use_persistent_root_digest, do_not_use_ab,
-                          no_hashtree, dynamic_partition_size=False,
-                          parallel=0):
+                          no_hashtree, dynamic_partition_size=False):
     """Implements the 'add_hashtree_footer' command.
 
     See https://gitlab.com/cryptsetup/cryptsetup/wikis/DMVerity for
@@ -3717,8 +3715,7 @@ class Avb(object):
                                                   hash_algorithm, salt,
                                                   digest_padding,
                                                   hash_level_offsets,
-                                                  tree_size,
-                                                  parallel=parallel)
+                                                  tree_size)
 
       # Generate HashtreeDescriptor with details about the tree we
       # just generated.
@@ -4160,54 +4157,8 @@ def generate_fec_data(image, num_roots, extra_data=b''):
   return bytes(fec) + footer
 
 
-def _hash_block_task(args):
-  """Hashes one source chunk (up to |chunk_bytes| bytes) and returns a
-  digest per block. Top-level so it can be dispatched by a thread pool.
-
-  args: (index, chunk, hash_alg_name, salt, block_size)
-  returns: (index, list_of_digests)
-  """
-  index, chunk, hash_alg_name, salt, block_size = args
-  digests = []
-  for i in range(0, len(chunk), block_size):
-    block = chunk[i:i + block_size]
-    if len(block) < block_size:
-      block = block + b'\0' * (block_size - len(block))
-    h = hashlib.new(hash_alg_name, salt)
-    h.update(block)
-    digests.append(h.digest())
-  return (index, digests)
-
-
-def _compute_hash_level(level_num, hash_src_size, block_size, hash_ret,
-                        image, hash_alg_name, salt, digest_padding,
-                        hash_level_offsets):
-  """Computes one level of the hash tree (single-threaded path)."""
-  level_output_list = []
-  remaining = hash_src_size
-  while remaining > 0:
-    hasher = hashlib.new(hash_alg_name, salt)
-    if level_num == 0:
-      image.seek(hash_src_size - remaining)
-      data = image.read(min(remaining, block_size))
-    else:
-      offset = hash_level_offsets[level_num - 1] + hash_src_size - remaining
-      data = hash_ret[offset:offset + block_size]
-    hasher.update(data)
-    remaining -= len(data)
-    if len(data) < block_size:
-      hasher.update(b'\0' * (block_size - len(data)))
-    level_output_list.append(hasher.digest())
-    if digest_padding > 0:
-      level_output_list.append(b'\0' * digest_padding)
-  level_output = b''.join(level_output_list)
-  padding_needed = round_to_multiple(len(level_output), block_size) - len(level_output)
-  return level_output + b'\0' * padding_needed
-
-
 def generate_hash_tree(image, image_size, block_size, hash_alg_name, salt,
-                       digest_padding, hash_level_offsets, tree_size,
-                       parallel=0):
+                       digest_padding, hash_level_offsets, tree_size):
   """Generates a Merkle-tree for a file.
 
   Arguments:
@@ -4219,78 +4170,48 @@ def generate_hash_tree(image, image_size, block_size, hash_alg_name, salt,
     digest_padding: The padding for each digest.
     hash_level_offsets: The offsets from calc_hash_level_offsets().
     tree_size: The size of the tree, in number of bytes.
-    parallel: Number of worker threads for level-0 hashing (0 = single-threaded).
-      Output bytes are identical for any value of parallel.
 
   Returns:
     A tuple where the first element is the top-level hash as bytes and the
     second element is the hash-tree as bytes.
   """
   hash_ret = bytearray(tree_size)
-  level_num = 0
+  hash_src_offset = 0
   hash_src_size = image_size
-
-  # Level 0 (the dominant cost for large images): parallelise block hashing.
-  # The source data is split into 256 MiB chunks; one task per chunk keeps
-  # thread overhead low while still giving enough work per thread to
-  # saturate the CPU.
-  use_parallel = parallel > 1 and image_size > block_size
-  if use_parallel:
-    # Aim for at least 4×parallel chunks so the pool stays saturated;
-    # cap at 64 MiB to keep per-task memory bounded.
-    min_chunks = parallel * 4
-    max_chunks = max(1, image_size // (64 * 1024 * 1024))
-    num_chunks = min(max(min_chunks, max_chunks),
-                     (image_size + block_size - 1) // block_size)
-    CHUNK_BYTES = max(block_size, (image_size + num_chunks - 1) // num_chunks)
-    image.seek(0)
-    source_data = image.read(image_size)
-    tasks = []
-    for c in range(num_chunks):
-      start = c * CHUNK_BYTES
-      end = min(start + CHUNK_BYTES, image_size)
-      tasks.append((c, source_data[start:end], hash_alg_name, salt,
-                    block_size))
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
-      chunk_results = list(pool.map(_hash_block_task, tasks))
-
-    # Flatten digests in block order and build level-0 output.
-    all_digests = []
-    for _, digests in chunk_results:
-      all_digests.extend(digests)
-    level0_parts = []
-    for d in all_digests:
-      level0_parts.append(d)
-      if digest_padding > 0:
-        level0_parts.append(b'\0' * digest_padding)
-    level0 = b''.join(level0_parts)
-    padding = round_to_multiple(len(level0), block_size) - len(level0)
-    level_output = level0 + b'\0' * padding
-    offset = hash_level_offsets[0]
-    hash_ret[offset:offset + len(level_output)] = level_output
-    hash_src_size = len(level_output)
-    level_num = 1
-  else:
-    # Single-threaded path: process level 0 and all remaining levels uniformly.
-    while hash_src_size > block_size:
-      level_output = _compute_hash_level(
-          level_num, hash_src_size, block_size, hash_ret, image,
-          hash_alg_name, salt, digest_padding,
-          hash_level_offsets)
-      offset = hash_level_offsets[level_num]
-      hash_ret[offset:offset + len(level_output)] = level_output
-      hash_src_size = len(level_output)
-      level_num += 1
-
-  # Remaining levels (single-threaded; tree shrinks fast, cost is negligible).
+  level_num = 0
   while hash_src_size > block_size:
-    level_output = _compute_hash_level(
-        level_num, hash_src_size, block_size, hash_ret, image,
-        hash_alg_name, salt, digest_padding,
-        hash_level_offsets)
+    level_output_list = []
+    remaining = hash_src_size
+    while remaining > 0:
+      hasher = hashlib.new(hash_alg_name, salt)
+      # Only read from the file for the first level - for subsequent
+      # levels, access the array we're building.
+      if level_num == 0:
+        image.seek(hash_src_offset + hash_src_size - remaining)
+        data = image.read(min(remaining, block_size))
+      else:
+        offset = hash_level_offsets[level_num - 1] + hash_src_size - remaining
+        data = hash_ret[offset:offset + block_size]
+      hasher.update(data)
+
+      remaining -= len(data)
+      if len(data) < block_size:
+        hasher.update(b'\0' * (block_size - len(data)))
+      level_output_list.append(hasher.digest())
+      if digest_padding > 0:
+        level_output_list.append(b'\0' * digest_padding)
+
+    level_output = b''.join(level_output_list)
+
+    padding_needed = (round_to_multiple(
+        len(level_output), block_size) - len(level_output))
+    level_output += b'\0' * padding_needed
+
+    # Copy level-output into resulting tree.
     offset = hash_level_offsets[level_num]
     hash_ret[offset:offset + len(level_output)] = level_output
+
+    # Continue on to the next level.
     hash_src_size = len(level_output)
     level_num += 1
 
@@ -4578,11 +4499,6 @@ class AvbTool(object):
                             help='Block size (default: 4096)',
                             type=parse_number,
                             default=4096)
-    sub_parser.add_argument('--parallel',
-                            help='Number of threads for level-0 hashing '
-                                 '(0 = auto, single-threaded)',
-                            type=int,
-                            default=0)
     # TODO(zeuthen): The --generate_fec option was removed when we
     # moved to generating FEC by default. To avoid breaking existing
     # users needing to transition we simply just print a warning below
@@ -5006,8 +4922,7 @@ class AvbTool(object):
         args.use_persistent_digest,
         args.do_not_use_ab,
         args.no_hashtree,
-        args.dynamic_partition_size,
-        getattr(args, 'parallel', 0))
+        args.dynamic_partition_size)
 
   def erase_footer(self, args):
     """Implements the 'erase_footer' sub-command."""
