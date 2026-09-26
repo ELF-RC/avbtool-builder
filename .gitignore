@@ -12,7 +12,3 @@ build/
 build_logs/
 logs/
 *.spec
-
-# Vendored upstream source trees (fetched at build time, not committed)
-/fec/
-/openssl/
