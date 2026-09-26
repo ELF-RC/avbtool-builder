@@ -12,9 +12,7 @@ build/
 build_logs/
 logs/
 *.spec
-EOF
 
-# Vendored AOSP source trees (kept locally, not tracked as gitlinks)
+# Vendored upstream source trees (fetched at build time, not committed)
 /fec/
 /openssl/
-
