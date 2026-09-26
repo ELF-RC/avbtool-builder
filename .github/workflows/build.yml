@@ -137,14 +137,12 @@ jobs:
           else
             BIN=".avbtool-dist/avbtool"
           fi
-          install -m 755 "$BIN" avbtool
-          zip -j "${{ steps.meta.outputs.name }}.zip" avbtool
+          install -m 755 "$BIN" "avbtool-${{ steps.meta.outputs.version }}-${{ matrix.arch }}"
 
       - name: Upload avbtool
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.name }}
-          path: ${{ steps.meta.outputs.name }}.zip
-          compression-level: 0
+          path: avbtool-${{ steps.meta.outputs.version }}-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 30
