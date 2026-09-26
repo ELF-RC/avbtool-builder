@@ -121,14 +121,12 @@ jobs:
             \( -name '*.log' -o -name '*.txt' -o -name '*.toc' -o -name '*.warnings' \) \
             -exec cp --parents {} logs/ \;
 
-          zip -r "${{ steps.meta.outputs.name }}-logs.zip" logs
-
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.name }}-logs
-          path: ${{ steps.meta.outputs.name }}-logs.zip
+          path: logs/
           compression-level: 0
           if-no-files-found: warn
           retention-days: 30
